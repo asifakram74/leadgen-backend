@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 0; background-color: #f8fafc; color: #1e293b; }
+        .container { max-width: 600px; margin: 40px auto; background: #ffffff; border-radius: 24px; overflow: hidden; box-shadow: 0 10px 40px rgba(0,0,0,0.05); }
+        .header { background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%); padding: 40px 20px; text-align: center; color: #ffffff; }
+        .content { padding: 40px; line-height: 1.6; }
+        .button { display: inline-block; padding: 14px 32px; background: #4f46e5; color: #ffffff !important; text-decoration: none; border-radius: 12px; font-weight: bold; margin-top: 24px; transition: background 0.3s; }
+        .footer { padding: 20px; text-align: center; font-size: 12px; color: #94a3b8; background: #f1f5f9; }
+        h1 { margin: 0; font-size: 28px; font-weight: 800; }
+        p { margin: 16px 0; }
+        .token-box { background: #f1f5f9; padding: 12px; border-radius: 8px; font-family: monospace; font-size: 14px; margin: 20px 0; text-align: center; color: #4f46e5; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>LeadStation Pro</h1>
+            <p style="margin-top: 10px; opacity: 0.8;">Action Required: Verify Identification</p>
+        </div>
+        <div class="content">
+            <h2>Welcome to the Network, {{ first_name }}!</h2>
+            <p>Your access to high-performance B2B leads intelligence has been provisioned. In order to activate your extraction crawler and decrypt verified lead data, please verify your email address.</p>
+            
+            <a href="{{ verification_url }}" class="button">Log In & Verify Identity</a>
+            
+            <p style="margin-top: 32px; font-size: 14px; color: #64748b;">If the button doesn't work, copy and paste this link into your browser:</p>
+            <div class="token-box">{{ verification_url }}</div>
+        </div>
+        <div class="footer">
+            © 2026 LeadStation Pro CRM. All rights strictly reserved.
+        </div>
+    </div>
+</body>
+</html>

@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.env
+.env.local
+
+# Database
+*.db
+*.db-journal
+*.sqlite3
+
+# Storage
+storage/profiles/*
+storage/exports/*
+!storage/profiles/.gitkeep
+!storage/exports/.gitkeep
+
+# IDE & OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

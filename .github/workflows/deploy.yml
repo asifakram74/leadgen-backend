@@ -1,0 +1,35 @@
+name: Deploy Backend to aaPanel
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PWD }}
+          script: |
+            # 1. Navigate to your project directory
+            # CHANGE THIS to your actual aaPanel path
+            cd /www/wwwroot/leadgen-api 
+
+            # 2. Pull latest code from GitHub
+            git pull origin main
+
+            # 3. Handle Python environment (aaPanel Python Manager setup)
+            # This assumes your virtualenv is named 'venv'
+            if [ -d "venv" ]; then
+              source venv/bin/activate
+            fi
+
+            # 4. Install dependencies
+            pip install -r requirements.txt
+
+            # 5. Restart application
+            # If using PM2 (highly recommended for FastAPI)
+            pm2 restart leadgen-api || pm2 start "uvicorn main:app --host 0.0.0.0 --port 8000" --name "leadgen-api"

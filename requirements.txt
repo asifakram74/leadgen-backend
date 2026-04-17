@@ -1,0 +1,12 @@
+playwright
+pandas
+tqdm
+playwright-stealth
+beautifulsoup4
+fastapi
+uvicorn
+pydantic
+fastapi-mail
+pydantic-settings
+python-dotenv
+openai
