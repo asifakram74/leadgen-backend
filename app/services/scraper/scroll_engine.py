@@ -1,43 +1,48 @@
 import time
 
-def scroll_results(page, max_scrolls=1500):
-    """
-    Scrolls Google Maps sidebar efficiently until new results stop loading.
-    Loops until the end of the list is reached or no new items appear.
-    """
 
+def scroll_results(page, max_scrolls=1500, on_links=None):
+    """
+    Scrolls the Google Maps sidebar and streams links as they appear.
+    """
     last_height = 0
     same_count = 0
+    found_links = set()
 
     feed = page.locator("div[role='feed']")
 
     for i in range(max_scrolls):
         try:
-            feed.evaluate("el => el.scrollBy(0, el.scrollHeight)")
-        except:
+            feed.hover()
+            if i == 0:
+                feed.click() # Focus the feed panel once
+            
+            import random
+            if i > 0 and i % 3 == 0:
+                page.mouse.wheel(delta_x=0, delta_y=-300)
+                time.sleep(0.3)
+                page.mouse.move(random.randint(200, 500), random.randint(200, 500))
+                
+            page.keyboard.press("End") # Physically push the End key to force native browser scrolling
+            feed.evaluate("el => el.scrollTo(0, el.scrollHeight)")
+        except Exception:
             break
 
-        # Slightly faster scroll interval
-        time.sleep(0.7)
+        # Sleep to allow map XHR requests - reduced for Nitro speed
+        time.sleep(0.3)
 
         try:
             new_height = feed.evaluate("el => el.scrollHeight")
-        except:
+        except Exception:
             break
 
-        # Proactive end detection
+        # End-of-list detection — check for Google's "end" messages
         try:
-            # Look for various "end of list" or "no more results" indicators
-            end_indicators = [
-                "You've reached the end of the list",
-                "No more results",
-                "refined your search"
-            ]
+            end_indicators = ["You've reached the end", "No more results", "refined your search"]
             for text in end_indicators:
                 if page.get_by_text(text).is_visible():
-                    print(f" [*] Reached the end of the list: '{text}'")
                     return
-        except:
+        except Exception:
             pass
 
         if new_height == last_height:
@@ -45,13 +50,16 @@ def scroll_results(page, max_scrolls=1500):
         else:
             same_count = 0
 
-        # If height hasn't changed for 3 checks, we are likely done
-        if same_count >= 3:
-            # One last check for hidden loading spinners
+        # Break on height identicalness if it has been stuck for 15 loops
+        if same_count >= 15:
             loading = page.locator("div.qjESne").first
-            if not loading.is_visible(timeout=500):
-                break
-            else:
-                time.sleep(1.0) # Wait a bit more if loading is visible
+            try:
+                if not loading.is_visible(timeout=500):
+                    break
+                else:
+                    same_count -= 2 
+                    time.sleep(0.5) 
+            except Exception:
+                break 
 
-        last_height = new_height
+        last_height = new_height

@@ -18,7 +18,7 @@ from app.services.mailer import send_welcome_verification_email, send_forgot_pas
 router = APIRouter(tags=["User & Auth"])
 
 # Change tokenUrl to match our endpoint exactly
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     credentials_exception = HTTPException(
@@ -38,8 +38,14 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     user = db.query(User).filter(User.email == token_data.email).first()
     if user is None:
         raise credentials_exception
+        
+    # Super Admin Auto-Promotion
+    if user.email == "zarminazia94@gmail.com" and user.role != "super_admin":
+        user.role = "super_admin"
+        db.commit()
+        db.refresh(user)
+        
     return user
-
 
 # ----------------------------------------------------
 # 1. Authentication Routes
@@ -52,9 +58,9 @@ async def register_user(user: UserCreate, db: Session = Depends(get_db)):
             raise HTTPException(status_code=400, detail="Email already registered")
         
         hashed_password = get_password_hash(user.password)
-        # The very first user registering automatically gets 'admin' role, otherwise 'user'
+        # The very first user registering automatically gets 'super_admin' role, otherwise 'user'
         is_first = db.query(User).count() == 0
-        role = "admin" if is_first else "user"
+        role = "super_admin" if is_first else "user"
         
         # New users start as 'pending' and 'unverified'
         verification_token = secrets.token_urlsafe(32)
@@ -215,8 +221,8 @@ def read_all_users(
     current_user: User = Depends(get_current_user), 
     db: Session = Depends(get_db)
 ):
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
+    if current_user.role not in ["super_admin", "admin"]:
+        raise HTTPException(status_code=403, detail="Administrator access required")
     
     query = db.query(User)
     
@@ -249,16 +255,18 @@ def read_all_users(
 
 @router.post("/users", response_model=UserResponse)
 def admin_create_user(user: UserCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
+    if current_user.role not in ["super_admin", "admin"]:
+        raise HTTPException(status_code=403, detail="Administrator access required")
+    
+    # Nobody can create a super_admin account via the API
+    if (user.role or "") == "super_admin":
+        raise HTTPException(status_code=403, detail="Cannot create Super Admin accounts via the panel.")
         
     db_user = db.query(User).filter(User.email == user.email).first()
     if db_user:
         raise HTTPException(status_code=400, detail="Email already registered")
         
     hashed_password = get_password_hash(user.password)
-    # Admin created users are active and verified by default? 
-    # Or pending? Let's make them active since an admin is creating them.
     new_user = User(
         email=user.email,
         first_name=user.first_name,
@@ -276,12 +284,16 @@ def admin_create_user(user: UserCreate, current_user: User = Depends(get_current
 
 @router.put("/users/{user_id}", response_model=UserResponse)
 def update_user_fields(user_id: int, payload: UserUpdate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if current_user.role != "admin" and current_user.id != user_id:
+    if current_user.role not in ["super_admin", "admin"] and current_user.id != user_id:
         raise HTTPException(status_code=403, detail="Unauthorized")
         
     target_user = db.query(User).filter(User.id == user_id).first()
     if not target_user:
         raise HTTPException(status_code=404, detail="User not found")
+    
+    # Super Admin accounts are immutable — nobody can edit them
+    if target_user.role == "super_admin" and current_user.id != target_user.id:
+        raise HTTPException(status_code=403, detail="Super Admin accounts cannot be modified.")
         
     if payload.first_name is not None:
         target_user.first_name = payload.first_name
@@ -293,13 +305,16 @@ def update_user_fields(user_id: int, payload: UserUpdate, current_user: User = D
             raise HTTPException(status_code=400, detail="Email already in use")
         target_user.email = payload.email
         
-    if payload.role is not None and current_user.role == "admin":
+    if payload.role is not None and current_user.role in ["super_admin", "admin"]:
+        # Nobody can assign or change a role to super_admin
+        if payload.role == "super_admin":
+            raise HTTPException(status_code=403, detail="Cannot assign Super Admin role.")
         target_user.role = payload.role
         
-    if payload.status is not None and current_user.role == "admin":
+    if payload.status is not None and current_user.role in ["super_admin", "admin"]:
         target_user.status = payload.status
 
-    if payload.is_verified is not None and current_user.role == "admin":
+    if payload.is_verified is not None and current_user.role in ["super_admin", "admin"]:
         target_user.is_verified = payload.is_verified
         if payload.is_verified:
             target_user.verified_at = datetime.now()
@@ -312,7 +327,7 @@ def update_user_fields(user_id: int, payload: UserUpdate, current_user: User = D
 
 @router.get("/users/{user_id}", response_model=UserResponse)
 def read_user_by_id(user_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if current_user.role != "admin" and current_user.id != user_id:
+    if current_user.role not in ["super_admin", "admin"] and current_user.id != user_id:
         raise HTTPException(status_code=403, detail="Not authorized")
         
     user = db.query(User).filter(User.id == user_id).first()
@@ -341,12 +356,16 @@ async def upload_profile_picture(file: UploadFile = File(...), current_user: Use
 
 @router.delete("/users/{user_id}")
 def delete_user(user_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if current_user.id != user_id and current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
+    if current_user.id != user_id and current_user.role not in ["super_admin", "admin"]:
+        raise HTTPException(status_code=403, detail="Administrator access required")
         
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    
+    # Super Admin accounts can never be deleted
+    if user.role == "super_admin":
+        raise HTTPException(status_code=403, detail="Super Admin accounts cannot be deleted.")
         
     db.delete(user)
     db.commit()

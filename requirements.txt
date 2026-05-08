@@ -10,3 +10,4 @@ fastapi-mail
 pydantic-settings
 python-dotenv
 openai
+reportlab

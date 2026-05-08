@@ -32,4 +32,4 @@ jobs:
 
             # 5. Restart application
             # If using PM2 (highly recommended for FastAPI)
-            pm2 restart leadgen-api || pm2 start "uvicorn main:app --host 0.0.0.0 --port 8000" --name "leadgen-api"
+            pm2 restart leadgen-api || pm2 start "uvicorn main:app --host 0.0.0.0 --port 8001" --name "leadgen-api"

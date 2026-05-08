@@ -1,18 +1,20 @@
 import re
 
+
 def safe_text(locator, selector):
     try:
         el = locator.query_selector(selector)
         return el.inner_text().strip() if el else ""
-    except:
+    except Exception:
         return ""
+
 
 def parse_place_details(page):
     try:
         # Wait for the title to be visible to ensure panel is loaded
         try:
-            page.wait_for_selector('h1', timeout=10000)
-        except:
+            page.wait_for_selector('h1', timeout=6000)
+        except Exception:
             pass
 
         name = safe_text(page, "h1")
@@ -43,7 +45,7 @@ def parse_place_details(page):
                 phone_raw = phone_el.query_selector("div.fontBodyMedium").inner_text().strip() if phone_el and phone_el.query_selector("div.fontBodyMedium") else ""
                 match = re.search(r'[\+\(]?[1-9][0-9 .\-\(\)]{8,}[0-9]', phone_raw)
                 phone = match.group(0) if match else phone_raw.split("\n")[-1].strip()
-        except:
+        except Exception:
             phone = ""
             
         # Website
@@ -54,8 +56,9 @@ def parse_place_details(page):
             else:
                 website_el = page.query_selector("a[data-item-id='authority']")
                 website = website_el.get_attribute("href") if website_el else ""
-        except:
+        except Exception:
             website = ""
+            
         # Address
         try:
             address_el = page.query_selector("button[data-tooltip*='address']")
@@ -67,11 +70,11 @@ def parse_place_details(page):
                 address = address_el.query_selector("div.fontBodyMedium").inner_text().strip() if address_el and address_el.query_selector("div.fontBodyMedium") else ""
             # Clean up newlines usually present with icons
             address = address.split("\n")[-1].strip() if address else ""
-        except:
+        except Exception:
             address = ""
             
         # Operating Status & Weekly Hours
-        status = ""  # Fix: initialize before try to avoid UnboundLocalError
+        status = ""
         open_hours = ""
         try:
             status_el = page.query_selector("div[data-item-id='oh'], button[data-item-id='oh']")
@@ -83,10 +86,10 @@ def parse_place_details(page):
                         status = line.replace('\u202f', ' ').strip()
                         break
 
-                # Extract Weekly Hours Table
+                # Extract Weekly Hours Table (No fast_mode check)
                 try:
                     status_el.click()
-                    page.wait_for_timeout(1000)
+                    page.wait_for_timeout(200)
                     trs = page.query_selector_all("tr")
                     hours_list = []
                     for tr in trs:
@@ -119,15 +122,59 @@ def parse_place_details(page):
         except Exception:
             pass
 
+        # Category
+        category = safe_text(page, "button[data-item-id='address']").split('\n')[0] if not name else safe_text(page, "button.DkEaL")
+        if not category:
+            category_el = page.query_selector("button[data-tooltip*='Category']")
+            category = category_el.inner_text().strip() if category_el else ""
+
+        # Price Level
+        price_level = safe_text(page, "span[aria-label*='Price:']")
+        
+        # Plus Code
+        plus_code = safe_text(page, "button[data-tooltip*='plus code']")
+
+        # Social Links (from Google Maps metadata if available)
+        socials = {}
+        try:
+            # Expanded search for social footprints
+            social_els = page.query_selector_all("a[data-tooltip*='social'], a[href*='facebook.com'], a[href*='instagram.com'], a[href*='linkedin.com'], a[href*='twitter.com'], a[href*='x.com'], a[href*='tiktok.com'], a[href*='youtube.com'], a[href*='upwork.com'], a[href*='snapchat.com'], a[href*='threads.net'], a[href*='pinterest.com'], a[href*='yelp.com']")
+            for s_el in social_els:
+                href = s_el.get_attribute("href")
+                if not href: continue
+                url_l = href.lower()
+                if "facebook.com" in url_l: socials["Facebook"] = href
+                elif "instagram.com" in url_l: socials["Instagram"] = href
+                elif "linkedin.com" in url_l: socials["LinkedIn"] = href
+                elif "twitter.com" in url_l or "x.com" in url_l: socials["X"] = href
+                elif "tiktok.com" in url_l: socials["TikTok"] = href
+                elif "youtube.com" in url_l: socials["YouTube"] = href
+                elif "upwork.com" in url_l: socials["Upwork"] = href
+                elif "snapchat.com" in url_l: socials["Snapchat"] = href
+                elif "threads.net" in url_l: socials["Threads"] = href
+                elif "pinterest.com" in url_l: socials["Pinterest"] = href
+                elif "yelp.com" in url_l: socials["Yelp"] = href
+        except Exception:
+            pass
+
         return {
             "name": name,
+            "category": category,
             "rating": rating,
             "reviews": reviews,
+            "price_level": price_level,
             "phone": phone,
             "website": website,
             "address": address,
+            "plus_code": plus_code,
+            "social_links": ", ".join([f"{k}: {v}" for k, v in socials.items()]),
             "operating_status": status,
-            "open_hours": open_hours,  # Fix: was collected but never returned
+            "open_hours": open_hours,
+            "maps_url": page.url,
+            "emails": "",
+            "whatsapp": "",
+            "generated_site_url": "",
+            "generated_domain": ""
         }
     except Exception as e:
         print(f" [+] Error parsing place: {e}")

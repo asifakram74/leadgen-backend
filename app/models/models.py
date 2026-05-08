@@ -27,6 +27,8 @@ class ScrapeJob(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, index=True)
+    category = Column(String, nullable=True)
+    location = Column(String, nullable=True)
     query_string = Column(String)
     csv_file_url = Column(String)
     json_file_url = Column(String)

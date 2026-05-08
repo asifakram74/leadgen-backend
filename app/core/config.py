@@ -1,8 +1,11 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Optional
+from typing import Optional, List
 import os
 
 class Settings(BaseSettings):
+    # --- ADD THIS LINE ---
+    BACKEND_CORS_ORIGINS: str = "http://localhost:3000,http://localhost:3001"
+
     # SMTP Settings
     MAIL_USERNAME: str = "your_email@gmail.com"
     MAIL_PASSWORD: str = "your_app_password"
@@ -16,12 +19,17 @@ class Settings(BaseSettings):
     VALIDATE_CERTS: bool = True
 
     # Application Settings
-    FRONTEND_URL: str = "https://leadfront.onlinetoolpot.com"
-    BACKEND_CORS_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000,https://leadfront.onlinetoolpot.com,http://leadfront.onlinetoolpot.com,https://leadgenfront.onlinetoolpot.com,http://leadgenfront.onlinetoolpot.com"
+    @property
+    def get_cors_origins(self) -> List[str]:
+        return [o.strip() for o in self.BACKEND_CORS_ORIGINS.split(",") if o.strip()]
+
+    # Will be overridden by the .env file. This is just a dev fallback.
     SECRET_KEY: str = "yoursupersecretkeyhere"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 43200
+    
+    # AI Configuration
+    DEEPSEEK_API_KEY: Optional[str] = None
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
-
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=True)
 settings = Settings()
