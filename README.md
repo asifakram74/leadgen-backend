@@ -51,5 +51,5 @@ LeadStation Pro is a high-performance B2B leads intelligence platform. This repo
 
 ## 🌐 API Documentation
 Once running, access the interactive documentation at:
-- Swagger UI: `http://localhost:8000/docs`
-- Redoc: `http://localhost:8000/redoc`
+- Swagger UI: `http://localhost:8001/docs`
+- Redoc: `http://localhost:8001/redoc`

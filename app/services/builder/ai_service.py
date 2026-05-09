@@ -1,11 +1,16 @@
 import os
 import re
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 from openai import OpenAI
+import google.generativeai as genai
 from typing import Dict, Optional
 from dotenv import load_dotenv
 from datetime import datetime
+
+# Suppress SSL verification warnings for fallback mode
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Ensure environment variables are loaded for background threads
 load_dotenv()
@@ -21,8 +26,13 @@ class AISiteService:
             )
         else:
             self.client = None
+            
+        # Gemini Configuration
+        self.gemini_key = os.getenv("GEMINI_API_KEY")
+        if self.gemini_key:
+            genai.configure(api_key=self.gemini_key)
 
-    def analyze_website(self, url: str, business_info: Dict) -> Dict:
+    def analyze_website(self, url: str, business_info: Dict, model_id: str = "deepseek-chat") -> Dict:
         """
         Master Audit Engine: Performs a high-technical-depth analysis of a website.
         Strictly prohibits fabrication and repetition.
@@ -32,16 +42,44 @@ class AISiteService:
             return {"status": "Analysis Error", "reason": "No API Key", "report": fallback_report}
 
         try:
-            # 1. Fetch page content with realistic headers
+            # 1. Fetch page content with robust headers
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1"
             }
-            response = requests.get(url, timeout=20, headers=headers)
-            if response.status_code != 200:
-                fallback_report = f"## Executive Summary\n\n**Critical Failure**: The AI was unable to reach the website.\n\n### Detailed Findings\n\n- **Connection Error**: Website returned HTTP {response.status_code}\n- **Action Required**: Verify that the domain is still active and not blocking automated access."
+            
+            # Ensure URL has protocol
+            if not url.startswith(('http://', 'https://')):
+                url = 'https://' + url
+            
+            response = None
+            last_error = ""
+            
+            # Try HTTPS then HTTP if needed, with SSL fallback
+            for attempt_url in [url, url.replace('https://', 'http://') if 'https://' in url else url.replace('http://', 'https://')]:
+                try:
+                    response = requests.get(attempt_url, timeout=7, headers=headers, allow_redirects=True)
+                    if response.status_code == 200: break
+                except requests.exceptions.SSLError:
+                    try:
+                        # Fallback for sites with expired/invalid SSL
+                        response = requests.get(attempt_url, timeout=7, headers=headers, allow_redirects=True, verify=False)
+                        if response.status_code == 200: break
+                    except Exception as e:
+                        last_error = str(e)
+                except Exception as e:
+                    last_error = str(e)
+            
+            if not response or response.status_code != 200:
+                sc = response.status_code if response else "Unknown"
+                fallback_report = f"## Executive Summary\n\n**Critical Failure**: The AI was unable to reach the website.\n\n### Detailed Findings\n\n- **Connection Error**: {last_error if last_error else f'HTTP {sc}'}\n- **Action Required**: Verify that the domain is still active and not blocking automated access."
                 return {
                     "status": "Unreachable",
-                    "reason": f"Website unreachable (Status {response.status_code})",
+                    "reason": f"Website unreachable ({sc})",
                     "report": fallback_report
                 }
 
@@ -127,15 +165,51 @@ SAMPLE PAGE CONTENT:
 TASK: Perform the audit according to the Master Rules. Be professional and strictly non-repetitive.
 """
 
-            completion = self.client.chat.completions.create(
-                model="deepseek-chat",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ]
-            )
-
-            report = completion.choices[0].message.content if completion.choices else ""
+            # ── Dynamic Model Routing ──
+            # Gemini API handles: gemini-* and gemma-* models
+            if "gemini" in model_id.lower() or "gemma" in model_id.lower():
+                if not self.gemini_key:
+                    raise Exception("Gemini API Key not configured. Please add GEMINI_API_KEY to your .env file.")
+                
+                # Pass model_id directly — supports all models in the dropdown.
+                # Only fall back to a known-good ID if a bare/generic or legacy string is passed.
+                if model_id.lower() in ["gemini", "gemini-flash", "gemini-pro", "gemini-1.5-flash", "gemini-1.5-pro"]:
+                    actual_model = "gemini-2.5-flash-preview-05-20"
+                elif "gemini-1.5" in model_id.lower():
+                    actual_model = "gemini-2.5-flash-preview-05-20"
+                else:
+                    actual_model = model_id
+                
+                # Debug: Log the incoming and resolved model
+                print(f"[AI ROUTER] Incoming: '{model_id}' | Resolved: '{actual_model}'")
+                
+                # Re-configure to be sure
+                genai.configure(api_key=self.gemini_key)
+                model = genai.GenerativeModel(actual_model)
+                
+                # Use same generation config as builder for stability
+                generation_config = {
+                    "temperature": 0.3, # Lower temperature for analytical precision
+                    "top_p": 0.95,
+                    "top_k": 40,
+                    "max_output_tokens": 4096,
+                }
+                
+                response = model.generate_content(f"{system_prompt}\n\n{user_prompt}", generation_config=generation_config)
+                report = response.text
+            else:
+                if not self.client:
+                    raise Exception("DeepSeek API Key not configured.")
+                    
+                actual_model = "deepseek-reasoner" if "reasoner" in model_id.lower() else "deepseek-chat"
+                completion = self.client.chat.completions.create(
+                    model=actual_model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ]
+                )
+                report = completion.choices[0].message.content if completion.choices else ""
             if not report:
                 fallback_report = "## Executive Summary\n\n**System Error**: The AI analysis engine failed to generate a detailed report for this asset. Please retry."
                 return {"status": "Analysis Error", "reason": "AI returned empty report", "report": fallback_report}
@@ -186,6 +260,39 @@ TASK: Perform the audit according to the Master Rules. Be professional and stric
         except Exception as e:
             fallback_report = f"## Executive Summary\n\n**Critical Failure**: The AI was unable to establish a connection to the website.\n\n### Detailed Findings\n\n- **Connection Error**: {str(e)}\n- **Action Required**: Verify that the domain is correctly spelled, still active, and has a valid SSL certificate."
             return {"status": "Unreachable", "reason": "Connection Failed", "report": fallback_report}
+
+    def _convert_html_to_pdf(self, html_path: str, pdf_path: str):
+        """
+        Uses Playwright to render the HTML report and save it as a high-fidelity PDF.
+        Synchronous wrapper for background thread usage.
+        """
+        from playwright.sync_api import sync_playwright
+        from app.services.scraper.browser_manager import get_browser_context
+        
+        with sync_playwright() as p:
+            # Use a dedicated worker ID for PDF generation to avoid locking with scrapers
+            context = get_browser_context(p, worker_id=888, headless=True)
+            page = context.new_page()
+            
+            # Convert file path to absolute file:// URL for Playwright
+            abs_html_path = os.path.abspath(html_path).replace('\\', '/')
+            file_url = f"file:///{abs_html_path}"
+            
+            # Navigate to the local HTML file
+            # Wait for network idle to ensure Google Fonts etc are loaded
+            page.goto(file_url, wait_until="networkidle")
+            
+            # Print to PDF with premium settings
+            page.pdf(
+                path=pdf_path,
+                format="A4",
+                print_background=True,
+                margin={"top": "0px", "right": "0px", "bottom": "0px", "left": "0px"},
+                display_header_footer=False,
+                prefer_css_page_size=True
+            )
+            
+            context.close()
 
     @staticmethod
     def get_safe_folder_name(name: str, identifier: str) -> str:
@@ -240,13 +347,20 @@ TASK: Perform the audit according to the Master Rules. Be professional and stric
         
         return scores
 
-    def create_audit_report_file(self, name: str, report_text: str, folder_path: str) -> str:
+    def create_audit_report_file(self, name: str, report_text: str, folder_path: str, model_id: str = "deepseek-chat") -> str:
         """
         Generates a cinematic, hyper-visual PDF and HTML audit report.
         """
         os.makedirs(folder_path, exist_ok=True)
         scores = self._extract_scores(report_text)
         generated_date = datetime.now().strftime("%B %d, %Y %H:%M")
+
+        # Determine Model Name for Badge
+        model_display = "DeepSeek"
+        if "gemini" in model_id.lower(): model_display = "Gemini"
+        elif "reasoner" in model_id.lower(): model_display = "DeepSeek R1"
+        
+        badge_text = f"Verified {model_display} AI Analysis"
 
         # ── 1. Create Premium HTML Report ──
         try:
@@ -262,8 +376,10 @@ TASK: Perform the audit according to the Master Rules. Be professional and stric
 
             # Clean and format the Markdown for HTML
             safe_report = report_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            safe_report = re.sub(r"\|.*\|", "", safe_report)
-            safe_report = re.sub(r"[-]{3,}", "", safe_report)
+            
+            # Highlight CRITICAL, HIGH, FAIL with badges
+            safe_report = re.sub(r'\*\*(CRITICAL|FAIL|HIGH)\*\*', r'<span class="badge-critical">\1</span>', safe_report)
+            safe_report = re.sub(r'\*\*(MEDIUM|LOW|HEALTHY)\*\*', r'<span class="badge-medium">\1</span>', safe_report)
 
             # Process headings with scores
             lines = safe_report.split("\n")
@@ -271,11 +387,14 @@ TASK: Perform the audit according to the Master Rules. Be professional and stric
             for line in lines:
                 if line.startswith("## ") or line.startswith("### "):
                     title = line.replace("#", "").strip()
+                    # Remove any existing badges for matching
+                    match_title = re.sub(r'<[^>]+>', '', title).lower()
+                    
                     score_tag = ""
                     for cat, score in scores.items():
-                        if cat.lower() in title.lower():
+                        if cat.lower() in match_title:
                             s100 = int(float(score) * 10)
-                            score_tag = f' <span style="background:{get_score_color(score)}; color:white; padding:2px 8px; border-radius:6px; font-size:12px; margin-left:10px;">SCORE: {s100}/100</span>'
+                            score_tag = f' <span class="header-score" style="background:{get_score_color(score)}">SCORE: {s100}/100</span>'
                             break
                     tag = "h2" if line.startswith("## ") else "h3"
                     processed_lines.append(f"<{tag}>{title}{score_tag}</{tag}>")
@@ -310,11 +429,7 @@ TASK: Perform the audit according to the Master Rules. Be professional and stric
                     s100 = int(float(val) * 10)
                     score_dashboard += f'''
                     <div class="score-item">
-                        <div class="score-circle-container">
-                            <div class="score-circle" style="background: conic-gradient({color} {s100}%, #f1f5f9 0)">
-                                <div class="score-inner">{s100}</div>
-                            </div>
-                        </div>
+                        <div class="score-value">{s100}%</div>
                         <div class="score-label">{lbl}</div>
                     </div>
                     '''
@@ -328,34 +443,30 @@ TASK: Perform the audit according to the Master Rules. Be professional and stric
 <title>Audit Report — {name}</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;800&family=Inter:wght@400;500;700&display=swap');
-  :root {{ --primary: #6366f1; --background: #f8fafc; --card: #ffffff; --text: #1e293b; --text-muted: #64748b; }}
-  body {{ font-family: 'Inter', sans-serif; line-height: 1.7; margin: 0; padding: 0; background: var(--background); color: var(--text); }}
-  .container {{ max-width: 900px; margin: 40px auto; background: var(--card); padding: 60px; border-radius: 40px; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.08); border: 1px solid rgba(0,0,0,0.05); }}
-  .header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 40px; padding-bottom: 30px; border-bottom: 2px solid #f1f5f9; }}
-  .header-left h1 {{ font-family: 'Outfit', sans-serif; font-weight: 800; font-size: 32px; margin: 0; letter-spacing: -1px; color: #0f172a; }}
-  .header-left .target {{ color: var(--primary); font-weight: 700; text-transform: uppercase; font-size: 14px; letter-spacing: 2px; }}
-  .badge-verified {{ background: #f0fdf4; color: #166534; padding: 6px 14px; border-radius: 12px; font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 1px; border: 1px solid #bbf7d0; }}
-  .score-dashboard {{ display: flex; justify-content: space-around; gap: 20px; margin-bottom: 50px; background: #f8fafc; padding: 30px; border-radius: 30px; }}
-  .score-item {{ text-align: center; flex: 1; }}
-  .score-circle-container {{ position: relative; width: 80px; height: 80px; margin: 0 auto 15px; }}
-  .score-circle {{ width: 100%; height: 100%; border-radius: 50%; display: flex; align-items: center; justify-content: center; }}
-  .score-inner {{ width: 80%; height: 80%; background: white; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 22px; font-weight: 800; color: #0f172a; box-shadow: inset 0 2px 4px rgba(0,0,0,0.05); }}
-  .score-label {{ font-size: 11px; font-weight: 800; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; }}
-  h2, h3 {{ font-family: 'Outfit', sans-serif; color: #0f172a; margin-top: 40px; }}
-  h2 {{ font-size: 24px; border-left: 5px solid var(--primary); padding-left: 15px; margin-bottom: 24px; background: #f8fafc; padding-top: 10px; padding-bottom: 10px; border-radius: 0 10px 10px 0; display: flex; align-items: center; justify-content: space-between; }}
-  h3 {{ font-size: 18px; color: var(--primary); display: flex; align-items: center; gap: 10px; }}
-  .report-body {{ font-size: 15px; color: #334155; }}
-  ul {{ padding-left: 0; list-style: none; }}
-  li {{ margin-bottom: 12px; padding: 15px; background: #fff; border-radius: 15px; border: 1px solid #f1f5f9; border-left: 4px solid #e2e8f0; }}
-  li:hover {{ border-color: var(--primary); }}
-  .footer {{ margin-top: 60px; padding-top: 30px; border-top: 1px solid #f1f5f9; text-align: center; font-size: 12px; color: var(--text-muted); }}
+  :root {{ --primary: #000000; --accent: #666666; --background: #ffffff; --card: #ffffff; --text: #000000; --text-muted: #666666; }}
+  body {{ font-family: 'Inter', sans-serif; line-height: 1.5; margin: 0; padding: 0; background: var(--background); color: var(--text); }}
+  .container {{ max-width: 750px; margin: 0 auto; background: var(--card); padding: 40px; }}
+  .header {{ border-bottom: 1px solid #000; margin-bottom: 30px; padding-bottom: 20px; }}
+  .header h1 {{ font-family: 'Outfit', sans-serif; font-weight: 700; font-size: 24px; margin: 0; }}
+  .header .target {{ font-size: 14px; color: var(--text-muted); margin-bottom: 5px; }}
+  .score-dashboard {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; margin-bottom: 30px; padding: 20px 0; border-bottom: 1px solid #eee; }}
+  .score-item {{ text-align: left; }}
+  .score-value {{ font-size: 20px; font-weight: 700; }}
+  .score-label {{ font-size: 10px; text-transform: uppercase; color: var(--text-muted); }}
+  h2, h3 {{ font-family: 'Outfit', sans-serif; margin-top: 30px; }}
+  h2 {{ font-size: 18px; border-bottom: 1px solid #eee; padding-bottom: 5px; }}
+  h3 {{ font-size: 14px; margin-bottom: 10px; }}
+  .report-body {{ font-size: 13px; }}
+  ul {{ padding-left: 15px; }}
+  li {{ margin-bottom: 5px; }}
+  .footer {{ margin-top: 40px; border-top: 1px solid #eee; padding-top: 20px; font-size: 10px; color: #999; text-align: center; }}
 </style>
 </head>
 <body>
   <div class="container">
     <div class="header">
-      <div class="header-left"><div class="target">{name}</div><h1>Intelligence Audit</h1></div>
-      <div class="badge-verified">Verified DeepSeek AI Analysis</div>
+      <div class="target">{name}</div>
+      <h1>Website Audit Report</h1>
     </div>
     {score_dashboard}
     <div class="report-body">{safe_report}</div>
@@ -367,107 +478,220 @@ TASK: Perform the audit according to the Master Rules. Be professional and stric
             with open(html_path, "w", encoding="utf-8") as f:
                 f.write(html)
 
-            # ── 2. Create Premium PDF Report ──
+            # ── 2. Create Premium PDF Report via Playwright ──
+            # This ensures the PDF looks EXACTLY like the HTML design
             try:
-                from reportlab.lib.pagesizes import A4
-                from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-                from reportlab.lib.units import mm
-                from reportlab.lib.colors import HexColor, white
-                from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable, Table, TableStyle
-                from reportlab.lib.enums import TA_CENTER, TA_RIGHT
-
                 pdf_path = os.path.join(folder_path, "audit_report.pdf")
-                doc = SimpleDocTemplate(pdf_path, pagesize=A4,
-                    rightMargin=15*mm, leftMargin=15*mm, topMargin=15*mm, bottomMargin=15*mm)
+                self._convert_html_to_pdf(html_path, pdf_path)
+                print(f"[*] Pixel-Perfect PDF generated via Playwright: {pdf_path}")
+            except Exception as e:
+                print(f"[PLAYWRIGHT PDF ERROR] {e}. Falling back to basic PDF engine.")
+                # FALLBACK: Basic ReportLab PDF if Playwright fails
+                try:
+                    from reportlab.lib.pagesizes import A4
+                    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+                    from reportlab.lib.units import mm
+                    from reportlab.lib.colors import HexColor, white, slateblue, slategray
+                    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable, Table, TableStyle
+                    from reportlab.lib.enums import TA_CENTER, TA_LEFT
 
-                styles = getSampleStyleSheet()
-                T = lambda name, **kw: ParagraphStyle(name, parent=styles["Normal"], **kw)
+                    doc = SimpleDocTemplate(pdf_path, pagesize=A4,
+                        rightMargin=20*mm, leftMargin=20*mm, topMargin=20*mm, bottomMargin=20*mm)
 
-                # Custom Styles
-                title_s = T("Ttl", fontSize=26, textColor=HexColor("#0f172a"), fontName="Helvetica-Bold", leading=32)
-                sub_s = T("Sub", fontSize=10, textColor=HexColor("#6366f1"), fontName="Helvetica-Bold", spaceAfter=20, letterSpacing=1)
-                sec_s = T("Sec", fontSize=14, textColor=white, fontName="Helvetica-Bold", spaceBefore=12, spaceAfter=8, backColor=HexColor("#0f172a"), leftIndent=0, borderPadding=8)
-                body_s = T("Bod", fontSize=10, textColor=HexColor("#334155"), leading=14, spaceAfter=6)
-                bullet_s = T("Bul", fontSize=10, textColor=HexColor("#334155"), leading=14, leftIndent=5*mm, spaceAfter=6)
+                    styles = getSampleStyleSheet()
+                    def T(name, **kw): return ParagraphStyle(name, parent=styles["Normal"], **kw)
 
-                story = []
-                story.append(Paragraph(f"{name.upper()}", sub_s))
-                story.append(Paragraph(f"Website Intelligence Audit", title_s))
-                story.append(Spacer(1, 10))
-                story.append(HRFlowable(width="100%", thickness=1, color=HexColor("#f1f5f9"), spaceAfter=15))
+                    # Professional Color Palette
+                    PRIMARY = HexColor("#1e293b")
+                    ACCENT = HexColor("#3b82f6")
+                    TEXT = HexColor("#334155")
+                    LIGHT = HexColor("#f1f5f9")
 
-                if scores:
-                    lbl_row = [Paragraph(lbl.upper(), T("L", fontSize=8, alignment=TA_CENTER, fontName="Helvetica-Bold")) for lbl, _ in scores.items()]
-                    val_row = [Paragraph(f"{val}<font size=8>/10</font>", T("V", fontSize=18, alignment=TA_CENTER, fontName="Helvetica-Bold")) for _, val in scores.items()]
-                    sc_table = Table([lbl_row, val_row], colWidths=[180 // len(scores) * mm] * len(scores))
-                    sc_table.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), HexColor("#f8fafc")), ("ROUNDEDCORNERS", [10]), ("TOPPADDING", (0, 0), (-1, -1), 8), ("BOTTOMPADDING", (0, 0), (-1, -1), 8)]))
-                    story.append(sc_table)
-                    story.append(Spacer(1, 20))
+                    # Custom Styles
+                    title_s = T("Ttl", fontSize=24, textColor=PRIMARY, fontName="Helvetica-Bold", leading=30)
+                    sub_s = T("Sub", fontSize=10, textColor=ACCENT, fontName="Helvetica-Bold", spaceAfter=5, letterSpacing=1)
+                    sec_s = T("Sec", fontSize=14, textColor=PRIMARY, fontName="Helvetica-Bold", spaceBefore=15, spaceAfter=10)
+                    body_s = T("Bod", fontSize=10, textColor=TEXT, leading=15, spaceAfter=8)
+                    bullet_s = T("Bul", fontSize=10, textColor=TEXT, leading=15, leftIndent=5*mm, spaceAfter=6)
 
-                clean_report = report_text.replace("&", "&amp;")
-                clean_report = re.sub(r"\|.*\|", "", clean_report)
-                clean_report = re.sub(r"[-]{3,}", "", clean_report)
-
-                for line in clean_report.split("\n"):
-                    line = line.strip()
-                    if not line: continue
+                    story = []
                     
-                    if line.startswith("## "):
-                        title = line.replace("#", "").strip().upper()
-                        current_score = ""
-                        for cat, score in scores.items():
-                            if cat.lower() in title.lower():
-                                current_score = f" [SCORE: {score}/10]"
-                                break
-                        story.append(Spacer(1, 10))
-                        story.append(Paragraph(f"  {title}{current_score}", sec_s))
-                        story.append(Spacer(1, 5))
-                    elif line.startswith("### "):
-                        story.append(Paragraph(line.replace("#", "").strip(), T("H3", fontSize=12, textColor=HexColor("#6366f1"), fontName="Helvetica-Bold", spaceAfter=5)))
-                    elif line.startswith("- ") or line.startswith("* "):
-                        clean_line = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", line[2:])
-                        story.append(Paragraph(f"• {clean_line}", bullet_s))
-                    else:
-                        clean_line = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", line)
-                        story.append(Paragraph(clean_line, body_s))
+                    # Header
+                    story.append(Paragraph(f"{name.upper()}", sub_s))
+                    story.append(Paragraph("Website Intelligence Audit", title_s))
+                    story.append(Spacer(1, 10))
+                    story.append(HRFlowable(width="100%", thickness=1.5, color=LIGHT, spaceAfter=20))
 
-                story.append(Spacer(1, 20))
-                story.append(HRFlowable(width="100%", thickness=0.5, color=HexColor("#f1f5f9")))
-                story.append(Paragraph(f"Generated by LeadStation AI  |  {generated_date}", T("Foot", fontSize=8, textColor=HexColor("#94a3b8"), alignment=TA_CENTER, spaceBefore=10)))
+                    # Score Grid
+                    if scores:
+                        data = []
+                        row_lbl = []
+                        row_val = []
+                        for lbl, val in scores.items():
+                            s100 = int(float(val) * 10)
+                            row_lbl.append(Paragraph(lbl.upper(), T("L", fontSize=8, fontName="Helvetica-Bold", textColor=slategray)))
+                            row_val.append(Paragraph(f"<b>{s100}%</b>", T("V", fontSize=16, fontName="Helvetica-Bold", textColor=PRIMARY)))
+                        
+                        data.append(row_lbl)
+                        data.append(row_val)
+                        
+                        sc_table = Table(data, colWidths=[170 // len(scores) * mm] * len(scores))
+                        sc_table.setStyle(TableStyle([
+                            ("BACKGROUND", (0, 0), (-1, -1), LIGHT),
+                            ("TOPPADDING", (0, 0), (-1, -1), 10),
+                            ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+                            ("LEFTPADDING", (0, 0), (-1, -1), 15),
+                            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                        ]))
+                        story.append(sc_table)
+                        story.append(Spacer(1, 25))
 
-                doc.build(story)
-            except Exception as e: print(f"[PDF ERROR] {e}")
+                    clean_report = report_text.replace("&", "&amp;")
+                    clean_report = re.sub(r"\|.*\|", "", clean_report) # Remove raw tables
+                    clean_report = re.sub(r"[-]{3,}", "", clean_report)
+
+                    for line in clean_report.split("\n"):
+                        line = line.strip()
+                        if not line: continue
+                        
+                        if line.startswith("## "):
+                            title = line.replace("#", "").strip()
+                            story.append(Spacer(1, 15))
+                            # Add a bottom border to section titles
+                            story.append(Paragraph(title, sec_s))
+                            story.append(HRFlowable(width="100%", thickness=0.5, color=LIGHT, spaceAfter=10))
+                        elif line.startswith("### "):
+                            story.append(Paragraph(line.replace("#", "").strip(), T("H3", fontSize=12, textColor=ACCENT, fontName="Helvetica-Bold", spaceAfter=8)))
+                        elif line.startswith("- ") or line.startswith("* "):
+                            clean_line = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", line[2:])
+                            story.append(Paragraph(f"• {clean_line}", bullet_s))
+                        else:
+                            clean_line = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", line)
+                            story.append(Paragraph(clean_line, body_s))
+
+                    story.append(Spacer(1, 30))
+                    story.append(HRFlowable(width="100%", thickness=0.5, color=LIGHT))
+                    story.append(Paragraph(f"Generated by LeadStation AI  |  {generated_date}", T("Foot", fontSize=8, textColor=slategray, alignment=TA_CENTER, spaceBefore=10)))
+
+                    doc.build(story)
+                except Exception as ex:
+                    print(f"[CRITICAL PDF FALLBACK ERROR] {ex}")
 
             rel = folder_path.replace("\\", "/").split("storage/")[-1]
             
-            # Prefer PDF if it exists, fallback to HTML
+            # Prefer PDF for the main return value as it's the professional standard
             pdf_path = os.path.join(folder_path, "audit_report.pdf")
             if os.path.exists(pdf_path):
                 return f"/storage/{rel}/audit_report.pdf"
-            return f"/storage/{rel}/audit_report.html"
+            
+            html_path = os.path.join(folder_path, "audit_report.html")
+            if os.path.exists(html_path):
+                return f"/storage/{rel}/audit_report.html"
+            
+            return ""
 
         except Exception as e:
             print(f"[REPORT ERROR] {e}")
             return ""
 
-    def generate_landing_page(self, lead_data: Dict, user_prompt: str = "") -> str:
-        """Generates a premium single-page HTML site."""
-        if not self.client: return "<h1>AI Generation Unavailable</h1>"
-        if user_prompt and user_prompt.strip():
-            prompt = user_prompt.strip()
-        else:
-            prompt = f"""
-            You are an expert front-end developer.
-            Business: {lead_data.get('name')} | Category: {lead_data.get('category')}
-            Analysis: {lead_data.get('ai_report')}
-            Return ONLY valid HTML/CSS code inside a single code block.
-            """
-            
-        completion = self.client.chat.completions.create(model="deepseek-chat", messages=[{"role": "user", "content": prompt}])
-        content = completion.choices[0].message.content
-        if content.startswith("```"):
-            lines = content.split('\n')
-            if lines[0].startswith("```"): lines = lines[1:]
-            if lines and lines[-1].startswith("```"): lines = lines[:-1]
-            content = '\n'.join(lines)
+    def _clean_ai_output(self, content: str) -> str:
+        # Robust cleanup for AI conversational preamble and Markdown blocks
+        if "```" in content:
+            # Extract content between first ```html and last ``` (or just first ``` and last ```)
+            matches = re.findall(r"```(?:html)?\s*([\s\S]*?)```", content, re.IGNORECASE)
+            if matches:
+                # Take the longest block as it's likely the full HTML
+                content = max(matches, key=len).strip()
+        
+        # Secondary fallback: If still no <html> tag but starts with DOCTYPE
+        if "<html" not in content.lower() and "<!doctype" in content.lower():
+            content = content[content.lower().find("<!doctype"):]
+
         return content
+
+    def generate_website(self, lead_data: Dict, user_prompt: str = "", model_id: str = "gemini-2.5-flash-preview-05-20") -> str:
+        """Alias for generate_landing_page to support maps_scraper.py"""
+        return self.generate_landing_page(lead_data, user_prompt, model_id)
+
+    def generate_landing_page(self, lead_data: Dict, user_prompt: str = "", model_id: str = "gemini-2.5-flash-preview-05-20") -> str:
+        """Generates a premium single-page HTML site using the specified model."""
+        
+        # ─── MASTER SYSTEM RULES (Hidden from User) ───────────────────
+        system_rules = f"""
+You are an ELITE Web Architect and UI/UX Designer. Build a WORLD-CLASS landing page for: {lead_data.get('name')}
+Category: {lead_data.get('category')}
+Analysis: {lead_data.get('ai_report', 'N/A')}
+
+### MANDATORY DESIGN RULES (DO NOT IGNORE):
+1. **DATA HARVESTING**: Use REAL data from the Analysis.
+2. **INDUSTRY INTENT**: 
+   - **Service/Medical**: Prioritize Trust, Service Grids, and 'Book Appointment'.
+   - **Food/Cafe/Shop**: Prioritize 'Mouth-watering' visuals, Menus, and Location.
+3. **ICONS**: Use FontAwesome 6 (fa-solid) ONLY.
+4. **IMAGES**: Use LoremFlickr: https://loremflickr.com/800/600/[keyword] (Use hyphenated-words).
+5. **UNIQUE DESIGN**: Pick a unique style: Minimalist, Dark Mode, Vibrant, or Corporate.
+6. **NO CONVERSATION**: Return ONLY the code inside a single code block starting with ```html. Do not include any intro text.
+7. **MAPS**: Embed a Google Maps iframe for: {lead_data.get('address') or lead_data.get('name')}.
+
+Return ONLY the code inside a single code block. No explanations.
+"""
+        
+        # Combine user instruction with system rules
+        final_prompt = f"{system_rules}\n\nUSER SPECIFIC INSTRUCTIONS:\n{user_prompt.strip() if user_prompt else 'Create a high-conversion site based on the analysis report.'}"
+
+        # Route to Gemini API (handles gemini-* and gemma-* models)
+        if "gemini" in model_id.lower() or "gemma" in model_id.lower():
+            if not self.gemini_key:
+                raise Exception("Gemini API Key not configured. Please add GEMINI_API_KEY to your .env file.")
+            
+            try:
+                # Only fall back to a known-good ID if a bare/generic or legacy string is passed.
+                if model_id.lower() in ["gemini", "gemini-flash", "gemini-pro", "gemini-1.5-flash", "gemini-1.5-pro"]:
+                    actual_model = "gemini-2.5-flash-preview-05-20"
+                elif "gemini-1.5" in model_id.lower():
+                    actual_model = "gemini-2.5-flash-preview-05-20"
+                else:
+                    actual_model = model_id
+                
+                # Debug: Log the incoming and resolved model
+                print(f"[AI ROUTER] Incoming: '{model_id}' | Resolved: '{actual_model}'")
+
+                # Re-configure to be absolutely sure
+                genai.configure(api_key=self.gemini_key)
+                model = genai.GenerativeModel(actual_model)
+                
+                # Add a safety setting to avoid being blocked by strict filters
+                generation_config = {
+                    "temperature": 0.7,
+                    "top_p": 0.95,
+                    "top_k": 40,
+                    "max_output_tokens": 8192,
+                }
+                
+                response = model.generate_content(final_prompt, generation_config=generation_config)
+                
+                if not response or not response.text:
+                    raise Exception("Gemini returned an empty response. This usually means the prompt was blocked by safety filters.")
+                
+                return self._clean_ai_output(response.text)
+            except Exception as e:
+                # Log the full error to the console for the user to see
+                print(f"[GEMINI ERROR] Model: {model_id} | Details: {str(e)}")
+                raise Exception(f"Intelligence Glitch (Gemini): {str(e)}")
+
+        # Route to DeepSeek
+        else:
+            if not self.client:
+                raise Exception("DeepSeek API Key not configured. Please add DEEPSEEK_API_KEY to your .env file.")
+            
+            try:
+                actual_model = "deepseek-reasoner" if "reasoner" in model_id.lower() else "deepseek-chat"
+                completion = self.client.chat.completions.create(
+                    model=actual_model,
+                    messages=[{"role": "user", "content": final_prompt}]
+                )
+                content = completion.choices[0].message.content
+                return self._clean_ai_output(content)
+            except Exception as e:
+                raise Exception(f"DeepSeek Error ({model_id}): {str(e)}")

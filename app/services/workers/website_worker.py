@@ -18,20 +18,27 @@ def queue_website_scrape(
     )
 
 
+import threading
+import os
+from app.services.scraper.browser_manager import get_browser_context
+
 def process_website_scrape(
     job_id,
     place_id,
     website_url
 ):
     try:
+        # Generate a worker ID based on thread name to use persistent 'pycache'
+        # Thread names are usually 'ThreadPoolExecutor-0_0', 'ThreadPoolExecutor-0_1', etc.
+        thread_name = threading.current_thread().name
+        try:
+            worker_id = int(thread_name.split('_')[-1]) % 10
+        except:
+            worker_id = 0
 
         with sync_playwright() as p:
 
-            browser = p.chromium.launch(
-                headless=True
-            )
-
-            context = browser.new_context()
+            context = get_browser_context(p, worker_id=worker_id, headless=True)
 
             page = context.new_page()
 
@@ -40,7 +47,7 @@ def process_website_scrape(
                 website_url
             )
 
-            browser.close()
+            context.close()
 
         update_place_website_data(
             job_id,

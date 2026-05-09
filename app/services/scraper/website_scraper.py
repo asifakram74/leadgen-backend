@@ -3,19 +3,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 import time
 
-# FIX: Block heavy resources during website visits too.
-# Images, fonts, and media are completely irrelevant for email/social extraction.
-BLOCKED_RESOURCE_TYPES = {"image", "stylesheet", "font", "media", "other"}
-
-
-def _block_resources(page):
-    def handle_route(route):
-        if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
-            route.abort()
-        else:
-            route.continue_()
-    page.route("**/*", handle_route)
-
+from app.services.scraper.browser_manager import block_heavy_resources
 
 def extract_website_details(page, url):
     """
@@ -44,7 +32,7 @@ def extract_website_details(page, url):
 
     try:
         # FIX: Block resources before navigating
-        _block_resources(page)
+        block_heavy_resources(page)
 
         # FIX: Tighter timeouts — 12s is plenty for contact info in initial HTML
         page.set_default_timeout(12000)

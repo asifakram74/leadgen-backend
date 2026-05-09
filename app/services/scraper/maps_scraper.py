@@ -16,24 +16,7 @@ from app.services.scraper.scroll_engine import scroll_results
 from app.services.scraper.parser import parse_place_details
 from app.services.scraper.dedup import deduplicate
 from app.services.builder.ai_service import AISiteService
-
-# ─────────────────────────────────────────────────────────────
-# Settings
-# ─────────────────────────────────────────────────────────────
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3_1) AppleWebKit/537.36 Chrome/122 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122 Safari/537.36",
-]
-
-VIEWPORTS = [
-    {"width": 1920, "height": 1080},
-    {"width": 1440, "height": 900},
-    {"width": 1366, "height": 768},
-]
-
-BLOCKED_RESOURCE_TYPES = {"image", "stylesheet", "font", "media"}
+from app.services.scraper.browser_manager import get_browser_context, block_heavy_resources
 
 # ─────────────────────────────────────────────────────────────
 # Trust Scoring
@@ -41,17 +24,23 @@ BLOCKED_RESOURCE_TYPES = {"image", "stylesheet", "font", "media"}
 
 def _score_trust(data: dict) -> str:
     try:
-        rating = float(data.get("rating", "0"))
-        reviews = int(data.get("reviews", "0").replace(",", ""))
+        # Handle "4.0" as float then int
+        r_str = str(data.get("rating", "0")).strip()
+        rating = float(r_str) if r_str else 0.0
+        
+        rev_str = str(data.get("reviews", "0")).replace(",", "").strip()
+        reviews = int(float(rev_str)) if rev_str else 0
     except Exception:
         return "Unknown"
 
+    if rating >= 4.5 and reviews >= 10:
+        return "Elite"
     if rating >= 4.0:
         return "Trustworthy"
     if rating >= 3.0:
-        return "Average" if reviews >= 50 else "Okay"
+        return "Verified" if reviews >= 20 else "Growing"
     if rating > 0:
-        return "Poor"
+        return "At Risk"
 
     return "Unknown"
 
@@ -73,28 +62,14 @@ def _process_place_batch(
 
     with sync_playwright() as p:
 
-        browser = p.chromium.launch(headless=True)
-
-        context = browser.new_context(
-            user_agent=USER_AGENTS[worker_id % len(USER_AGENTS)],
-            viewport=VIEWPORTS[worker_id % len(VIEWPORTS)],
-            locale="en-GB",
-            timezone_id="Asia/Karachi",
-        )
-
-        def _block_resources(route):
-            if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
-                route.abort()
-            else:
-                route.continue_()
+        # Use persistent context ('pycache' browser)
+        context = get_browser_context(p, worker_id=worker_id, headless=headless)
 
         try:
             for local_idx, link in enumerate(links):
 
                 page = context.new_page()
-
-                page.route("**/*", _block_resources)
-
+                block_heavy_resources(page)
                 page.set_default_timeout(15000)
 
                 Stealth().apply_stealth_sync(page)
@@ -144,7 +119,6 @@ def _process_place_batch(
 
         finally:
             context.close()
-            browser.close()
 
     return results
 
@@ -166,23 +140,13 @@ class GoogleMapsScraper:
 
         with sync_playwright() as p:
 
-            browser = p.chromium.launch(headless=True)
-
-            context = browser.new_context(
-                user_agent=random.choice(USER_AGENTS),
-                viewport=random.choice(VIEWPORTS),
-            )
+            # Use worker_id 999 for the search phase 'pycache'
+            context = get_browser_context(p, worker_id=999, headless=self.headless)
 
             page = context.new_page()
             
             # Speed optimization: Block heavy resources in search phase too
-            def _block_resources(route):
-                if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
-                    route.abort()
-                else:
-                    route.continue_()
-            
-            page.route("**/*", _block_resources)
+            block_heavy_resources(page)
             Stealth().apply_stealth_sync(page)
 
             url = f"https://www.google.com/maps/search/{query.replace(' ', '+')}?hl=en"
@@ -241,7 +205,7 @@ class GoogleMapsScraper:
                     if href not in place_links:
                         place_links.append(href)
 
-            browser.close()
+            context.close()
 
         return place_links[:max_results]
 
@@ -310,14 +274,13 @@ class GoogleMapsScraper:
         print(f"[Scraper] Phase 1 done — {len(all_results)} total raw leads.")
         return all_results[:max_r]
 
-    def run_ai_pipeline(self, all_results, on_data=None):
+    def run_ai_pipeline(self, all_results, query: str = "general", on_data=None, model_id: str = "deepseek-chat"):
         """
         Phase 2 ONLY: Run AI audit on already-collected leads.
-        Call this in a background thread after scrape_only() is done.
-        Website building is now triggered manually by the user.
         """
-        print(f"[AI] Starting audit on {len(all_results)} leads...")
-        audited = self._run_ai_audit(all_results, on_data=on_data)
+        print(f"[AI] Starting high-speed audit on {len(all_results)} leads using {model_id} for query: {query}...")
+        # Uses the specified model (DeepSeek by default for high quality)
+        audited = self._run_ai_audit(all_results, query=query, on_data=on_data, model_id=model_id)
         print(f"[AI] Pipeline complete — {len(audited)} leads audited.")
         return audited
 
@@ -386,14 +349,22 @@ class GoogleMapsScraper:
     def _run_ai_audit(
         self,
         all_results,
+        query: str = "general",
         on_data=None,
+        model_id: str = "deepseek-chat",
     ):
+        import re
+        query_slug = re.sub(r'[^a-zA-Z0-9]+', '_', query).strip('_').lower()
 
-        print("Starting AI Audit Phase")
+        print(f"Starting AI Audit Phase for: {query}")
 
         def audit_lead(lead):
             if not lead.get("website"):
                 lead["ai_status"] = "Skipped"
+                return lead
+
+            # Skip re-auditing if lead already has a finalized status from a previous cache
+            if lead.get("ai_status") in ["Healthy", "Issues", "No Issue", "complete"]:
                 return lead
 
             try:
@@ -406,6 +377,7 @@ class GoogleMapsScraper:
                         "name": lead.get("name"),
                         "category": lead.get("category"),
                     },
+                    model_id=model_id
                 )
 
                 lead["ai_status"] = audit.get("status", "Issues")
@@ -417,7 +389,6 @@ class GoogleMapsScraper:
                 if "emails" not in lead: lead["emails"] = ""
                 if "whatsapp" not in lead: lead["whatsapp"] = ""
 
-                # ── Enrich Contact Data from Website ───────────
                 if audit.get("social_links"):
                     existing_links = [l.strip() for l in lead.get("social_links", "").split(",") if l.strip()]
                     new_links = [l.strip() for l in audit["social_links"].split(",") if l.strip()]
@@ -433,21 +404,46 @@ class GoogleMapsScraper:
                 if audit.get("whatsapp") and not lead.get("whatsapp"):
                     lead["whatsapp"] = audit["whatsapp"]
 
-                # 2. Generate Audit Report File (PDF/HTML)
+                # ── 2. Generate Audit Report File (PDF/HTML) ──
                 if lead["ai_report"]:
-                    # Create a unique folder for this lead
-                    safe_name = "".join(x for x in lead["name"] if x.isalnum() or x in " -_").strip().replace(" ", "_")
-                    lead_folder = os.path.join("storage", "leads", f"{safe_name}_{uuid.uuid4().hex[:6]}")
+                    # Respect existing lead_folder
+                    lead_folder = lead.get("lead_folder")
+                    if not lead_folder:
+                        raw_name = lead.get("name", "lead")
+                        clean_name = re.sub(r'[^a-zA-Z0-9]+', '_', raw_name).strip('_')
+                        import hashlib
+                        stable_id = lead.get("place_id") or lead.get("maps_url", "")
+                        url_hash = hashlib.md5(stable_id.encode()).hexdigest()[:6]
+                        lead_folder = f"{query_slug}/{clean_name}_{url_hash}"
+                        lead["lead_folder"] = lead_folder
+                    
+                    full_folder_path = os.path.join("storage", "leads", lead_folder.replace("storage/", "", 1).replace("leads/", "", 1))
                     
                     report_url = ai_service.create_audit_report_file(
                         lead["name"],
                         lead["ai_report"],
-                        lead_folder
+                        full_folder_path
                     )
                     
-                    lead["audit_report_url"] = report_url
-                    lead["lead_folder"] = lead_folder.replace("\\", "/").replace("storage/", "")
+                    # Standardized URLs: HTML for live view, PDF for professional download
+                    if report_url.endswith(".html"):
+                        html_url = report_url
+                        pdf_url = report_url.replace(".html", ".pdf")
+                    elif report_url.endswith(".pdf"):
+                        pdf_url = report_url
+                        html_url = report_url.replace(".pdf", ".html")
+                    else:
+                        html_url = report_url
+                        pdf_url = report_url
 
+                    lead["audit_report_html_url"] = html_url
+                    lead["audit_report_pdf_url"] = pdf_url
+                    lead["audit_report_url"] = pdf_url # Keep legacy pointing to PDF
+                
+                # Ensure contact fields exist
+                if "social_links" not in lead: lead["social_links"] = ""
+                if "emails" not in lead: lead["emails"] = ""
+                if "whatsapp" not in lead: lead["whatsapp"] = ""
             except Exception as e:
                 lead["ai_status"] = "Analysis Error"
                 lead["ai_reason"] = str(e)

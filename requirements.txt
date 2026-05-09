@@ -11,3 +11,8 @@ pydantic-settings
 python-dotenv
 openai
 reportlab
+google-generativeai
+sqlalchemy
+python-jose[cryptography]
+bcrypt
+python-multipart

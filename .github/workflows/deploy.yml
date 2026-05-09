@@ -16,7 +16,7 @@ jobs:
           script: |
             # 1. Navigate to your project directory
             # CHANGE THIS to your actual aaPanel path
-            cd /www/wwwroot/leadgen-api 
+            cd /www/wwwroot/leadbackend.onlinetoolpot.com
 
             # 2. Pull latest code from GitHub
             git pull origin main
@@ -32,4 +32,4 @@ jobs:
 
             # 5. Restart application
             # If using PM2 (highly recommended for FastAPI)
-            pm2 restart leadgen-api || pm2 start "uvicorn main:app --host 0.0.0.0 --port 8001" --name "leadgen-api"
+            pm2 restart leadbackend.onlinetoolpot.com|| pm2 start "uvicorn main:app --host 0.0.0.0 --port 8001" --name "leadgen-api"

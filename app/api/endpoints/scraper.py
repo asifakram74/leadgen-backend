@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from typing import Optional, Dict, Any
@@ -64,11 +65,11 @@ def _load_meta(job_uuid: str) -> Optional[dict]:
 
 class ScrapeRequest(BaseModel):
     category: str
-    location: Optional[str] = ""
-    max_results: Optional[int] = None
+    location: str
+    auto_audit: bool = True # Default to True for "Wow" factor
 
 
-def _run_scrape_job(job_uuid: str, query: str, category: str, max_results: Optional[int], user_id: int):
+def _run_scrape_job(job_uuid: str, query: str, category: str, user_id: int, initial_data: list = None, db_job_id: int = None, auto_audit: bool = True):
     """
     Runs the full scrape pipeline in a daemon thread with incremental updates.
     """
@@ -79,13 +80,29 @@ def _run_scrape_job(job_uuid: str, query: str, category: str, max_results: Optio
     discovery_engine = GoogleMapsScraper()
     
     # Track results incrementally
+    # ─── Unified Query Core Storage ───
+    # All search sessions for the same query now update the same MASTER files in a dedicated folder.
     safe_query = slugify(query)
-    json_filename = f"export_{safe_query}_{job_uuid}.json"
-    json_path = os.path.join("storage", "exports", json_filename)
-    os.makedirs(os.path.dirname(json_path), exist_ok=True)
+    export_dir = os.path.join("storage", "exports", safe_query)
+    os.makedirs(export_dir, exist_ok=True)
+    
+    json_path = os.path.join(export_dir, f"{safe_query}.json")
+    csv_path = os.path.join(export_dir, f"{safe_query}.csv")
 
     # Cumulative results tracking
-    master_results = []
+    master_results = initial_data or []
+    
+    # If we have initial data, write it to disk immediately so it's available for the new job ID
+    if master_results:
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(master_results, f, indent=2, ensure_ascii=False)
+            print(f"[*] Pre-populated cache for {job_uuid} with {len(master_results)} existing leads.")
+            _job_store[job_uuid]["count"] = len(master_results)
+            _job_store[job_uuid]["data"] = master_results
+        except Exception as e:
+            print(f"[!] Cache pre-population error: {e}")
+
     results_lock = threading.Lock()
 
     def on_data_callback(new_chunk):
@@ -97,23 +114,32 @@ def _run_scrape_job(job_uuid: str, query: str, category: str, max_results: Optio
             for item in new_chunk:
                 if "generated_site_url" not in item: item["generated_site_url"] = ""
                 if "generated_domain" not in item: item["generated_domain"] = ""
-                if "audit_report_url" not in item: item["audit_report_url"] = ""
+                if "audit_report_html_url" not in item: item["audit_report_html_url"] = ""
+                if "audit_report_pdf_url" not in item: item["audit_report_pdf_url"] = ""
                 if "ai_status" not in item: item["ai_status"] = "Pending..."
                 if "ai_reason" not in item: item["ai_reason"] = "Waiting for analysis..."
                 if "category" not in item: item["category"] = category
+                
+                # Pre-calculate lead_folder for consistency across all services
+                if "lead_folder" not in item or not item["lead_folder"]:
+                    import hashlib
+                    stable_id = item.get("place_id") or item.get("maps_url", "")
+                    url_hash = hashlib.md5(stable_id.encode()).hexdigest()[:6]
+                    raw_name = item.get("name", "lead")
+                    clean_name = re.sub(r'[^a-zA-Z0-9]+', '_', raw_name).strip('_')
+                    item["lead_folder"] = f"{slugify(query)}/{clean_name}_{url_hash}"
             
             # 2. Merge & Update Existing Items (Deduplicated by maps_url)
-            # Create a lookup map for existing results
+            # We PROTECT enriched data (audits, sites) during the merge.
             master_map = {r.get("maps_url"): i for i, r in enumerate(master_results) if r.get("maps_url")}
             
             for item in new_chunk:
                 m_url = item.get("maps_url")
                 if m_url in master_map:
-                    # Update existing lead with new data (e.g. AI status, reports)
-                    idx = master_map[m_url]
-                    master_results[idx].update(item)
+                    # Append-Only Strategy: We NEVER change existing data to ensure absolute integrity.
+                    pass 
                 else:
-                    # Add as new lead
+                    # Add as brand-new discovery
                     master_results.append(item)
                     master_map[m_url] = len(master_results) - 1
 
@@ -131,7 +157,7 @@ def _run_scrape_job(job_uuid: str, query: str, category: str, max_results: Optio
     try:
         from app.services.scraper.geo_service import GeoService
         
-        max_r = max_results or 50000
+        max_r = 50000
         
         # Determine location
         loc = query.replace(category, "").replace(" in ", "").strip()
@@ -142,6 +168,10 @@ def _run_scrape_job(job_uuid: str, query: str, category: str, max_results: Optio
             sub_queries = GeoService.get_sub_queries(category, loc)
         
         # ── PHASE 1: RAW SCRAPING ──────────────────────────────────
+        # The URLs are stable and based on the query name and its subfolder
+        csv_url = f"/storage/exports/{safe_query}/{safe_query}.csv"
+        json_url = f"/storage/exports/{safe_query}/{safe_query}.json"
+
         # Collect all place data and stream to UI immediately.
         # Job is marked 'done' after this — user gets results fast.
         raw_results = discovery_engine.scrape_only(
@@ -150,51 +180,54 @@ def _run_scrape_job(job_uuid: str, query: str, category: str, max_results: Optio
             on_data=on_data_callback
         )
 
-        # Export raw results right away
-        csv_filename = f"export_{safe_query}_{job_uuid}.csv"
-        json_filename = f"export_{safe_query}_{job_uuid}.json"
-        csv_path = os.path.join("storage", "exports", csv_filename)
-        json_path = os.path.join("storage", "exports", json_filename)
+        # Scraping pass complete
+        
+        # PHASE 1 COMPLETE - Moving to AI Background Extraction
+        discovery_engine.export_csv(master_results, csv_path)
+        discovery_engine.export_json(master_results, json_path)
 
-        discovery_engine.export_csv(raw_results, csv_path)
-        discovery_engine.export_json(raw_results, json_path)
-
-        csv_url = f"/storage/exports/{csv_filename}"
-        json_url = f"/storage/exports/{json_filename}"
-
-        # Persist DB record
+        # --- Update DB Record ---
         db = SessionLocal()
         try:
-            job = ScrapeJob(
-                user_id=user_id,
-                category=category,
-                location=query,
-                query_string=query,
-                csv_file_url=csv_url,
-                json_file_url=json_url
-            )
-            db.add(job)
-            db.commit()
-            db.refresh(job)
-            db_job_id = job.id
+            from app.models.models import ScrapeJob
+            if db_job_id:
+                job = db.query(ScrapeJob).filter(ScrapeJob.id == db_job_id).first()
+                if job:
+                    job.csv_file_url = csv_url
+                    job.json_file_url = json_url
+                    db.commit()
+            else:
+                job = ScrapeJob(
+                    user_id=user_id,
+                    category=category,
+                    location=query,
+                    query_string=query,
+                    csv_file_url=csv_url,
+                    json_file_url=json_url
+                )
+                db.add(job)
+                db.commit()
+            print(f"[*] Intelligence Record Sync'd to Vault: {job_uuid}")
+        except Exception as e:
+            print(f"[!] DB Error: {e}")
         finally:
             db.close()
 
-        # Mark job as DONE for scraping — UI can show results now
+        # Mark job as AUDITING — UI will continue polling for AI results
         meta = {
-            "status": "done",
+            "status": "auditing", 
             "count": len(raw_results),
             "csv_url": csv_url,
             "json_url": json_url,
             "job_id": db_job_id,
             "error": None,
-            "ai_status": "auditing",  # AI is still running in background
+            "ai_status": "auditing",
         }
         _job_store[job_uuid].update(meta)
         _job_store[job_uuid]["data"] = raw_results
         _save_meta(job_uuid, _job_store[job_uuid])
 
-        print(f"[*] Scrape job {job_uuid} — Phase 1 done. {len(raw_results)} leads ready. Launching AI in background...")
+        print(f"[*] Scrape job {job_uuid} — Scraping complete. Launching AI Pipeline...")
 
         # ── PHASE 2: AI AUDIT IN BACKGROUND ───────────────────────
         # Runs after job is 'done' — updates the JSON file progressively.
@@ -210,16 +243,23 @@ def _run_scrape_job(job_uuid: str, query: str, category: str, max_results: Optio
                     print(f"[!] AI update save error: {e}")
 
             try:
-                discovery_engine.run_ai_pipeline(raw_results, on_data=ai_update_callback)
-                # Final save
-                discovery_engine.export_csv(raw_results, csv_path)
-                with open(json_path, "w", encoding="utf-8") as f:
-                    json.dump(raw_results, f, indent=2, ensure_ascii=False)
+                # Audit the ENTIRE master list to ensure absolute persistence
+                # Using DeepSeek as requested for high-quality SEO/UI/Technical insights
+                discovery_engine.run_ai_pipeline(master_results, query=query, model_id="deepseek-chat", on_data=ai_update_callback)
+                
+                # FINAL ATOMIC SAVE: Sync everything to disk one last time
+                discovery_engine.export_csv(master_results, csv_path)
+                discovery_engine.export_json(master_results, json_path)
+                
                 _job_store[job_uuid]["ai_status"] = "complete"
-                print(f"[*] Background AI pipeline complete for {job_uuid}.")
+                _job_store[job_uuid]["status"] = "done" # FINALLY DONE
+                _save_meta(job_uuid, _job_store[job_uuid])
+                print(f"[*] Background AI pipeline complete for {job_uuid}. Total {len(master_results)} leads persisted.")
             except Exception as e:
                 print(f"[!] Background AI pipeline error for {job_uuid}: {e}")
                 _job_store[job_uuid]["ai_status"] = "error"
+                _job_store[job_uuid]["status"] = "done"
+                _save_meta(job_uuid, _job_store[job_uuid])
 
         ai_thread = threading.Thread(target=run_background_ai, daemon=True)
         ai_thread.start()
@@ -262,21 +302,131 @@ def start_scrape(
         query = f"{category_clean} in {location_clean}"
     print(f"[*] Queuing scrape job: {query}")
 
+    # ─── Active Job Sharing: Real-Time Progress Sync ───
+    # If a job is ALREADY running for this exact query, we let this user "spectate" it.
+    for active_uuid, job_info in _job_store.items():
+        if job_info.get("status") in ["running", "queued"] and job_info.get("query_string") == query:
+            print(f"[*] Spectator Alert: Joining active job {active_uuid} for query: {query}")
+            
+            # Create a history record for this user too, so they have it in their vault
+            db_job = ScrapeJob(
+                user_id=current_user.id,
+                category=request.category,
+                location=location_clean,
+                query_string=query,
+                csv_file_url=job_info.get("csv_url", ""),
+                json_file_url=job_info.get("json_url", "")
+            )
+            db.add(db_job)
+            db.commit()
+            
+            return {
+                "job_id": active_uuid, 
+                "status": job_info.get("status"), 
+                "count": job_info.get("count", 0),
+                "data": job_info.get("data", []),
+                "query": query,
+                "message": "Live Matrix Sync: You are now spectating an active extraction in progress."
+            }
+
+    # ─── Global Cache Check: Instant Intelligence Retrieval ───
+    # We search across ALL previous jobs for this exact query to build a comprehensive base.
+    from sqlalchemy import func
+    previous_jobs = db.query(ScrapeJob).filter(
+        func.lower(ScrapeJob.category) == category_clean.lower(),
+        func.lower(ScrapeJob.location) == location_clean.lower()
+    ).all()
+    
+    initial_data = []
+    seen_urls = set()
+    
+    if previous_jobs:
+        print(f"[*] Intelligence Merge: Scanning {len(previous_jobs)} historical records for: {query}")
+        for job in previous_jobs:
+            if not job.json_file_url: continue
+            json_path = job.json_file_url.lstrip("/")
+            if os.path.exists(json_path):
+                try:
+                    with open(json_path, "r", encoding="utf-8") as f:
+                        job_data = json.load(f)
+                        # Use a map to handle enrichment during the merge
+                        lead_map = {l.get("maps_url"): i for i, l in enumerate(initial_data) if l.get("maps_url")}
+                        
+                        for lead in job_data:
+                            m_url = lead.get("maps_url")
+                            if not m_url: continue
+                            
+                            if m_url in lead_map:
+                                # Enrichment Check: Does this version have more data?
+                                idx = lead_map[m_url]
+                                existing = initial_data[idx]
+                                
+                                # If the new lead has a site and the existing doesn't, overwrite
+                                has_site = lead.get("generated_site_url")
+                                has_audit = lead.get("audit_report_url")
+                                
+                                if (has_site and not existing.get("generated_site_url")) or \
+                                   (has_audit and not existing.get("audit_report_url")):
+                                    print(f"[*] Intelligence Promotion: Found enriched version of {lead.get('name')}")
+                                    initial_data[idx].update(lead)
+                            else:
+                                initial_data.append(lead)
+                                lead_map[m_url] = len(initial_data) - 1
+                except Exception as e:
+                    print(f"[!] Warning: Could not merge historical data from {json_path}: {e}")
+        
+        if initial_data:
+            print(f"[*] Instant Discovery Active: Found {len(initial_data)} unique leads in history.")
+
+    # ─── Master Query Core ───
+    # We use a deterministic filename based on the query slug to isolate data.
+    safe_query = slugify(query)
+    csv_url = f"/storage/exports/{safe_query}/{safe_query}.csv"
+    json_url = f"/storage/exports/{safe_query}/{safe_query}.json"
+
     job_uuid = str(uuid.uuid4())
-    _job_store[job_uuid] = {"status": "queued", "count": 0, "error": None}
+    
+    # ─── Immediate Assignment ───
+    # Create the DB record with the CORRECT location-specific URLs
+    db_job = ScrapeJob(
+        user_id=current_user.id,
+        category=request.category,
+        location=location_clean,
+        query_string=query,
+        csv_file_url=csv_url, 
+        json_file_url=json_url
+    )
+    db.add(db_job)
+    db.commit()
+    db.refresh(db_job)
+
+    _job_store[job_uuid] = {
+        "status": "running" if initial_data else "queued", 
+        "count": len(initial_data), 
+        "data": initial_data,
+        "query_string": query,
+        "csv_url": csv_url,
+        "json_url": json_url,
+        "error": None
+    }
 
     thread = threading.Thread(
         target=_run_scrape_job,
-        args=(job_uuid, query, request.category, request.max_results, current_user.id),
+        args=(job_uuid, query, request.category, current_user.id, initial_data),
+        kwargs={"db_job_id": db_job.id, "auto_audit": request.auto_audit},
         daemon=True,
     )
     thread.start()
 
     return {
         "job_id": job_uuid, 
-        "status": "queued", 
+        "status": "running" if initial_data else "queued", 
+        "count": len(initial_data),
+        "data": initial_data,
         "query": query,
-        "message": "High-performance scraper active. Extracting leads with optimized speed and AI auditing."
+        "csv_url": csv_url,
+        "json_url": json_url,
+        "message": "Instant Discovery Active. Merging existing leads with live Google Maps data." if initial_data else "High-performance scraper active. Extracting leads with optimized speed and AI auditing."
     }
 
 
@@ -300,7 +450,8 @@ def get_scrape_status(
     
     # Lazy load data if missing but status is done or running (from disk)
     if (job.get("status") in ["done", "running"]) and "data" not in job:
-        json_url = job.get("json_url") or f"/storage/exports/export_{slugify(job.get('query_string', ''))}_{job_id}.json"
+        safe_query = slugify(job.get('query_string', ''))
+        json_url = job.get("json_url") or f"/storage/exports/{safe_query}/{safe_query}.json"
         json_path = json_url.lstrip("/")
         if os.path.exists(json_path):
             try:
@@ -310,6 +461,22 @@ def get_scrape_status(
                 pass
     return job
 
+
+@router.get("/download/audit")
+def download_audit_report(path: str):
+    """
+    Forces a direct download of an audit PDF.
+    """
+    clean_path = path.lstrip("/")
+    if not os.path.exists(clean_path):
+        raise HTTPException(status_code=404, detail="Report file not found.")
+    
+    filename = os.path.basename(clean_path)
+    return FileResponse(
+        path=clean_path,
+        filename=filename,
+        media_type='application/pdf'
+    )
 
 @router.get("/leads")
 def get_user_scrape_history(
@@ -333,9 +500,15 @@ def get_user_scrape_history(
                 for job in jobs
             ]
         
-        # Default: Only show current user's data
+        # Default: Only show current user's data, grouped by query to avoid duplicates
+        # We use a subquery to get the latest job ID for each unique query_string
+        from sqlalchemy import func
+        latest_jobs_subquery = db.query(
+            func.max(ScrapeJob.id).label("max_id")
+        ).filter(ScrapeJob.user_id == current_user.id).group_by(ScrapeJob.query_string).subquery()
+
         jobs = db.query(ScrapeJob).filter(
-            ScrapeJob.user_id == current_user.id
+            ScrapeJob.id.in_(db.query(latest_jobs_subquery.c.max_id))
         ).order_by(ScrapeJob.created_at.desc()).all()
 
         return [
@@ -355,29 +528,54 @@ def get_user_scrape_history(
 
 @router.delete("/lead/{job_id}")
 def delete_scrape_job(
-    job_id: int,
+    job_id: str,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
     Deletes a specific scrape job from DB and its associated files from disk.
+    Supports both DB integer IDs and session UUIDs.
     """
-    job = db.query(ScrapeJob).filter(ScrapeJob.id == job_id, ScrapeJob.user_id == current_user.id).first()
+    job = None
+    
+    # 1. Try to find by integer ID first (if job_id is numeric)
+    if job_id.isdigit():
+        query = db.query(ScrapeJob).filter(ScrapeJob.id == int(job_id))
+        # Admins can delete anything; regular users only their own
+        if current_user.role not in ["super_admin", "admin"]:
+            query = query.filter(ScrapeJob.user_id == current_user.id)
+        job = query.first()
+    
+    # 2. Fallback: Try to find by job_uuid if not found or not numeric
+    if not job:
+        # Note: We'd need a uuid column in ScrapeJob for perfect sync, 
+        # but for now we can infer it from the file paths or job store
+        # For simplicity, we assume integer IDs are the primary deletion method from the UI
+        pass
 
     if not job:
         raise HTTPException(status_code=404, detail="Extraction not found or unauthorized.")
 
-    # File Cleanup
-    try:
-        csv_path = job.csv_file_url.lstrip("/")
-        json_path = job.json_file_url.lstrip("/")
-        meta_path = os.path.join(META_DIR, f"{job_id}.meta.json")
-
-        for path in [csv_path, json_path, meta_path]:
-            if os.path.exists(path):
-                os.remove(path)
-    except Exception as e:
-        print(f"[!] Error deleting files for job {job_id}: {e}")
+        # File Cleanup
+        import shutil
+        csv_path = job.csv_file_url.lstrip("/") if job.csv_file_url else ""
+        json_path = job.json_file_url.lstrip("/") if job.json_file_url else ""
+        
+        # If files are in a hierarchical folder (storage/exports/[slug]/...), delete the whole folder
+        if json_path and "storage/exports/" in json_path:
+            parent_dir = os.path.dirname(json_path)
+            if os.path.exists(parent_dir) and os.path.basename(parent_dir) != "exports":
+                shutil.rmtree(parent_dir)
+        else:
+            # Fallback for old flat structure
+            for path in [csv_path, json_path]:
+                if path and os.path.exists(path):
+                    os.remove(path)
+                    
+        # Meta files
+        meta_path_id = os.path.join(META_DIR, f"{job.id}.meta.json")
+        if os.path.exists(meta_path_id):
+            os.remove(meta_path_id)
 
     db.delete(job)
     db.commit()
@@ -387,6 +585,7 @@ def delete_scrape_job(
 class ReAuditRequest(BaseModel):
     lead_id: str
     job_uuid: Optional[str] = None
+    model_id: Optional[str] = "deepseek-chat"
 
 @router.post("/lead/re-audit")
 async def re_audit_lead(
@@ -400,30 +599,54 @@ async def re_audit_lead(
     if not os.path.exists(META_DIR):
         os.makedirs(META_DIR, exist_ok=True)
         
-    target_job_uuid = request.job_uuid
+    from app.db.database import SessionLocal
+    db = SessionLocal()
     found_path = ""
+    target_job_uuid = request.job_uuid
+    
+    try:
+        from app.models.models import ScrapeJob
+        if target_job_uuid:
+            job = db.query(ScrapeJob).filter(
+                (ScrapeJob.id.cast(db.String) == target_job_uuid) | 
+                (ScrapeJob.query_string == target_job_uuid)
+            ).first()
+            if job and job.json_file_url:
+                found_path = job.json_file_url.lstrip("/")
+        
+        if not found_path:
+            # Fallback 1: search in latest 50 jobs
+            jobs = db.query(ScrapeJob).order_by(ScrapeJob.created_at.desc()).limit(50).all()
+            for job in jobs:
+                if job.json_file_url:
+                    temp_path = job.json_file_url.lstrip("/")
+                    if os.path.exists(temp_path):
+                        try:
+                            with open(temp_path, "r", encoding="utf-8") as f:
+                                leads_list = json.load(f)
+                                if any(l.get("id") == request.lead_id for l in leads_list):
+                                    found_path = temp_path
+                                    target_job_uuid = str(job.id)
+                                    break
+                        except: continue
 
-    # 1. Find which job this lead belongs to
-    if not target_job_uuid:
-        print(f"[*] Searching for Lead ID: {request.lead_id} in {META_DIR}")
-        for filename in os.listdir(META_DIR):
-            if filename.endswith(".json") and not filename.endswith(".meta.json"):
-                temp_path = os.path.join(META_DIR, filename)
+        if not found_path:
+            # Fallback 2: AGGRESSIVE DISK SEARCH (Search exports, leads, AND all JSON in storage)
+            import glob
+            all_json = glob.glob("storage/exports/**/*.json", recursive=True) + \
+                       glob.glob("storage/leads/**/*.json", recursive=True)
+            
+            for temp_path in all_json:
                 try:
                     with open(temp_path, "r", encoding="utf-8") as f:
-                        content = f.read().strip()
-                        if not content: continue
-                        leads_list = json.loads(content)
-                        if any(l.get("id") == request.lead_id for l in leads_list):
-                            target_job_uuid = filename.replace(".json", "")
+                        leads_list = json.load(f)
+                        if isinstance(leads_list, list) and any(l.get("id") == request.lead_id for l in leads_list):
                             found_path = temp_path
-                            print(f"[*] Found lead in job: {target_job_uuid}")
+                            target_job_uuid = "global_search"
                             break
-                except Exception as e:
-                    print(f"[!] Warning: Could not read {filename}: {e}")
-                    continue
-    else:
-        found_path = os.path.join(META_DIR, f"{target_job_uuid}.json")
+                except: continue
+    finally:
+        db.close()
 
     if not target_job_uuid or not os.path.exists(found_path):
         raise HTTPException(status_code=404, detail="Lead not found in any existing jobs")
@@ -442,43 +665,103 @@ async def re_audit_lead(
         from app.services.builder.ai_service import AISiteService
         ai_service = AISiteService()
         
-        # Clear old error status
-        target_lead["ai_status"] = "Retrying Analysis..."
-        target_lead["ai_reason"] = "Manual retry triggered."
+        # Ensure audit fields exist to prevent frontend "undefined" errors
+        target_lead["ai_status"] = "Auditing..."
+        target_lead["ai_reason"] = "Manual re-audit started."
+        if "ai_report" not in target_lead: target_lead["ai_report"] = ""
+        if "audit_report_html_url" not in target_lead: target_lead["audit_report_html_url"] = ""
+        if "audit_report_pdf_url" not in target_lead: target_lead["audit_report_pdf_url"] = ""
 
         # Run Audit
         print(f" [*] Re-triggering Audit for: {target_lead.get('name')} at {target_lead.get('website')}")
         audit = ai_service.analyze_website(target_lead.get("website", ""), {
             "name": target_lead.get("name"),
             "category": target_lead.get("category", "")
-        })
+        }, model_id=request.model_id)
 
         actual_status = audit.get("status", "Issues")
         report_text = audit.get("report", "")
         
-        # Create folder & report if needed
-        import hashlib, re
-        stable_id = target_lead.get("place_id") or target_lead.get("maps_url", "")
-        url_hash = hashlib.md5(stable_id.encode()).hexdigest()[:8]
-        raw_name = target_lead.get("name", "lead").lower()
-        clean_name = re.sub(r'[^a-z0-9]+', '-', raw_name).strip('-')
-        folder_name = f"{clean_name}-{url_hash}"
-        lead_path = os.path.join("storage", "leads", folder_name)
+        # ── Step 2: Resolve the existing folder path ──
+        import glob
+        
+        # Initial guess for query_folder based on the current job's path
+        if "storage/exports/" in found_path:
+            parts = found_path.replace("\\", "/").split("storage/exports/")
+            # Extract the query slug from the folder name
+            query_folder = parts[1].split("/")[0] if len(parts) > 1 else ""
+        elif "storage/leads/" in found_path:
+            parts = found_path.replace("\\", "/").split("storage/leads/")
+            query_folder = parts[1].split("/")[0] if len(parts) > 1 else ""
+        else:
+            query_folder = os.path.basename(found_path).replace("export_", "").replace(".json", "")
+            
+        existing_folder = target_lead.get("lead_folder")
+        folder_name = ""
+        lead_path = ""
+        
+        # 1. Aggressive Search: If we have a folder name, find where it is hiding
+        search_name = existing_folder.split("/")[-1].split("\\")[-1] if existing_folder else ""
+        if not search_name:
+            import hashlib, re
+            stable_id = target_lead.get("place_id") or target_lead.get("maps_url", "")
+            url_hash = hashlib.md5(stable_id.encode()).hexdigest()[:6]
+            raw_name = target_lead.get("name", "lead")
+            search_name = f"{re.sub(r'[^a-zA-Z0-9]+', '_', raw_name).strip('_')}_{url_hash}"
+
+        search_pattern = os.path.join("storage", "leads", "**", search_name)
+        matches = glob.glob(search_pattern, recursive=True)
+        
+        # Filter out 'unsorted' if possible
+        clean_matches = [m for m in matches if "unsorted" not in m.replace("\\", "/")]
+        final_matches = clean_matches if clean_matches else matches
+        
+        if final_matches:
+            lead_path = final_matches[0]
+            # Extract query_folder and folder_name from the found path
+            rel_path = lead_path.replace("\\", "/").split("storage/leads/")[-1].strip("/")
+            parts = rel_path.split("/")
+            if len(parts) >= 2:
+                query_folder = parts[0]
+                folder_name = parts[1]
+            else:
+                folder_name = rel_path
+            print(f"[*] Scraper found existing folder: {lead_path}")
+        else:
+            # Create new folder where it belongs
+            folder_name = search_name
+            lead_path = os.path.join("storage", "leads", query_folder if query_folder else "", folder_name)
+        
+        os.makedirs(lead_path, exist_ok=True)
 
         report_url = ""
+        pdf_url = ""
         if actual_status != "No Issue" and report_text:
             report_url = ai_service.create_audit_report_file(
                 target_lead.get("name", "Lead"),
                 report_text,
-                lead_path
+                lead_path,
+                model_id=request.model_id
             )
+            print(f" [*] AI Service returned report_url: {report_url}")
+            
+            # Force explicit split to ensure HTML is for preview and PDF for download
+            if report_url.endswith(".html"):
+                pdf_url = report_url.replace(".html", ".pdf")
+            elif report_url.endswith(".pdf"):
+                pdf_url = report_url
+                report_url = report_url.replace(".pdf", ".html")
+            else:
+                pdf_url = report_url
 
         # Update lead in place with fresh intelligence & contacts
         target_lead["ai_status"] = actual_status
         target_lead["ai_reason"] = audit.get("reason", "Analysis Complete")
         target_lead["ai_report"] = report_text
-        target_lead["audit_report_url"] = report_url
-        target_lead["lead_folder"] = folder_name
+        target_lead["audit_report_html_url"] = report_url
+        target_lead["audit_report_pdf_url"] = pdf_url
+        target_lead["audit_report_url"] = pdf_url 
+        target_lead["lead_folder"] = f"{query_folder}/{folder_name}"
 
         # Ensure contact fields exist
         if "social_links" not in target_lead: target_lead["social_links"] = ""
@@ -518,15 +801,16 @@ async def re_audit_lead(
                         df.loc[mask, "ai_status"] = actual_status
                         df.loc[mask, "ai_reason"] = target_lead["ai_reason"]
                         df.loc[mask, "ai_report"] = report_text
-                        df.loc[mask, "audit_report_url"] = report_url
-                        df.loc[mask, "lead_folder"] = folder_name
+                        df.loc[mask, "audit_report_html_url"] = report_url
+                        df.loc[mask, "audit_report_pdf_url"] = pdf_url
+                        df.loc[mask, "lead_folder"] = f"{query_folder}/{folder_name}"
                         df.to_csv(csv_path, index=False)
                         print(f"[*] Updated CSV file: {csv_path}")
             except Exception as csv_err:
                 print(f"[!] Error updating CSV: {csv_err}")
 
         # Final check: Ensure the report URL is clean for the frontend
-        if target_lead["audit_report_url"] and target_lead["audit_report_url"].startswith("/"):
+        if target_lead.get("audit_report_html_url") and target_lead["audit_report_html_url"].startswith("/"):
             # If your frontend prefers "leads/..." instead of "/storage/leads/..."
             # we can strip the prefix here if needed, but usually /storage/ is better.
             pass

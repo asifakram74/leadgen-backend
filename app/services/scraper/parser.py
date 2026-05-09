@@ -137,7 +137,6 @@ def parse_place_details(page):
         # Social Links (from Google Maps metadata if available)
         socials = {}
         try:
-            # Expanded search for social footprints
             social_els = page.query_selector_all("a[data-tooltip*='social'], a[href*='facebook.com'], a[href*='instagram.com'], a[href*='linkedin.com'], a[href*='twitter.com'], a[href*='x.com'], a[href*='tiktok.com'], a[href*='youtube.com'], a[href*='upwork.com'], a[href*='snapchat.com'], a[href*='threads.net'], a[href*='pinterest.com'], a[href*='yelp.com']")
             for s_el in social_els:
                 href = s_el.get_attribute("href")
@@ -157,6 +156,20 @@ def parse_place_details(page):
         except Exception:
             pass
 
+        # Images (Real Google Photos)
+        images = []
+        try:
+            img_els = page.query_selector_all("img[src*='googleusercontent.com'], img[src*='ggpht.com']")
+            for img in img_els:
+                src = img.get_attribute("src")
+                if src and "https" in src and "=w" in src:
+                    clean_src = re.sub(r'=w\d+-h\d+', '=w800-h600', src)
+                    if clean_src not in images:
+                        images.append(clean_src)
+                if len(images) >= 5: break
+        except Exception:
+            pass
+        
         return {
             "name": name,
             "category": category,
@@ -171,6 +184,7 @@ def parse_place_details(page):
             "operating_status": status,
             "open_hours": open_hours,
             "maps_url": page.url,
+            "images": ", ".join(images),
             "emails": "",
             "whatsapp": "",
             "generated_site_url": "",

@@ -244,7 +244,7 @@ class GeoService:
         }
 
     @staticmethod
-    def get_infinite_grid(category: str, location: str, max_results: int) -> list[str]:
+    def get_infinite_grid(category: str, location: str) -> list[str]:
         """
         Bypasses the 120-result Google Maps limit by fetching the bounding box of the target location 
         and slicing it into a mathematical grid of GPS coordinates.
@@ -253,10 +253,11 @@ class GeoService:
         
         print(f" [*] Infinite Grid Dispatcher initializing for: {location}")
         
-        # If the requested quota is small (< 500), just use the standard sub_queries method to save time
-        if max_results < 500:
-            print(" [*] Quota < 500, falling back to standard area dispatch.")
-            return GeoService.get_sub_queries(category, location)
+        max_results = 5000
+        
+        # Standard area dispatch fallback check (disabled for infinite scraping)
+        # if False:
+        #     return GeoService.get_sub_queries(category, location)
             
         safe_q = urllib.parse.quote(location)
         url = f"https://nominatim.openstreetmap.org/search?format=json&addressdetails=1&limit=1&q={safe_q}"

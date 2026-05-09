@@ -345,8 +345,14 @@ async def upload_profile_picture(file: UploadFile = File(...), current_user: Use
     filename = f"user_{current_user.id}.{file_extension}"
     file_path = os.path.join("storage", "profiles", filename)
     
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    # Use a threadpool to avoid blocking the main event loop during file I/O
+    from starlette.concurrency import run_in_threadpool
+    
+    def save_file():
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+    await run_in_threadpool(save_file)
         
     url_path = f"/storage/profiles/{filename}"
     current_user.profile_picture_url = url_path
